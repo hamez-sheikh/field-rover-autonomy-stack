@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'world_simulator = '
+            'field_rover_sim.world_simulator_node:main',
         ],
     },
 )
