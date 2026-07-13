@@ -1,0 +1,19 @@
+# ROS 2 colcon outputs
+rover_ws/build/
+rover_ws/install/
+rover_ws/log/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# C/C++ build products
+*.o
+*.so
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
