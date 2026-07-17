@@ -26,6 +26,8 @@ setup(
         'console_scripts': [
             'world_simulator = '
             'field_rover_sim.world_simulator_node:main',
+            'range_sensor = '
+            'field_rover_sim.range_sensor_node:main',
         ],
     },
 )
