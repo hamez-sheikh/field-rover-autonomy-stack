@@ -30,6 +30,8 @@ setup(
             'field_rover_sim.range_sensor_node:main',
             'wheel_odometry = '
             'field_rover_sim.wheel_odometry_node:main',
+            'imu_sensor = '
+            'field_rover_sim.imu_sensor_node:main',
         ],
     },
 )

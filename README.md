@@ -43,6 +43,21 @@ Day 5 wheel-odometry milestone:
   cumulative drift away from ground truth — the first intentionally
   imperfect position estimate in the project
 
+Day 6 simulated-IMU milestone:
+
+- Pure-Python planar IMU model (`field_rover_sim/imu_sensor.py`),
+  independent of ROS 2
+- `imu_sensor` node deriving gyroscope and accelerometer readings from
+  `/ground_truth/odom` velocity, independent of wheel odometry and range
+  sensing
+- World-frame velocity differentiation, rotated into the rover body frame,
+  to produce ideal forward/lateral acceleration (including lateral
+  acceleration while turning)
+- Configurable deterministic gyroscope/accelerometer bias and reproducible
+  seeded Gaussian noise; orientation is explicitly marked unavailable
+  (`orientation_covariance[0] = -1.0`) since this milestone measures motion,
+  it does not estimate heading
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -101,12 +116,66 @@ instead of republishing ground truth with an offset.
 - No IMU, GPS, random noise, or sensor fusion yet — only deterministic
   wheel-calibration drift.
 
-Run all three nodes together:
+### Simulated IMU
+
+The `imu_sensor` node derives simulated gyroscope and accelerometer readings
+from `/ground_truth/odom` instead of publishing perfect ground truth. It is
+independent of `wheel_odometry` and `range_sensor` — a separate sensor with
+its own imperfections, parameters, and tests.
+
+This is a **planar simplification**, not a full 6-DOF physical IMU:
+
+- Only yaw rate (rotation about the vertical axis) is modelled; roll and
+  pitch rate are always zero.
+- Only forward (body x) and lateral (body y) acceleration are modelled;
+  vertical (body z) acceleration is always zero.
+- Gravity is excluded — a stationary rover reads approximately zero
+  acceleration (plus configured bias/noise), not ~9.81 m/s^2 upward.
+- No orientation estimate is produced. `orientation_covariance[0]` is set to
+  `-1.0` (the `sensor_msgs/Imu` convention for "not populated") and the
+  orientation quaternion is the identity placeholder — ground-truth yaw is
+  never published as if it were an IMU estimate.
+
+Math, in order:
+
+1. World-frame velocity from body-forward speed and yaw:
+   `vx = v * cos(yaw)`, `vy = v * sin(yaw)`.
+2. Numerical differentiation of world-frame velocity between consecutive
+   samples gives world-frame acceleration.
+3. That acceleration is rotated into the rover body frame using yaw, giving
+   ideal forward (x) and lateral (y) acceleration — this is what makes
+   constant-speed turning produce lateral acceleration (`a_y ≈ v * omega`),
+   not just straight-line speed changes.
+4. Configured constant bias and reproducible seeded Gaussian noise
+   (`random.Random(random_seed)`, never the global `random` module) are
+   added to both the gyroscope and accelerometer readings.
+
+Default parameters: `gyro_bias_z` = 0.01 rad/s, `accel_bias_x` = 0.03 m/s^2,
+`accel_bias_y` = -0.02 m/s^2, `gyro_noise_stddev` = 0.005 rad/s,
+`accel_noise_stddev` = 0.02 m/s^2, `random_seed` = 42, `max_dt` = 0.5 s.
+
+Covariance is populated from configured noise variance
+(`stddev ** 2`) on the diagonal — it represents random measurement noise
+only, not the constant bias offset and not any fused/estimation
+uncertainty. Unmodelled axes (roll/pitch rate, vertical acceleration) use a
+large fixed variance to mark them as untrustworthy placeholders.
+
+The first `/ground_truth/odom` sample, and any sample with a non-positive or
+excessive (`> max_dt`) time step, reports zero ideal acceleration instead of
+a false spike from an unreliable time difference; the gyroscope reading
+needs no history and is unaffected.
+
+Publishes `sensor_msgs/msg/Imu` on `/imu/data` with `header.frame_id =
+"imu_link"`. No GPS or sensor fusion is implemented yet — Day 6 produces
+measurements only; it does not estimate pose, heading, or velocity.
+
+Run all four nodes together:
 
 ```bash
 ros2 run field_rover_sim world_simulator
 ros2 run field_rover_sim range_sensor
 ros2 run field_rover_sim wheel_odometry
+ros2 run field_rover_sim imu_sensor
 ```
 
 Override calibration at launch, e.g. to compare against perfect wheels:
@@ -114,6 +183,13 @@ Override calibration at launch, e.g. to compare against perfect wheels:
 ```bash
 ros2 run field_rover_sim wheel_odometry --ros-args \
   -p left_wheel_scale:=1.0 -p right_wheel_scale:=1.0
+```
+
+Override IMU bias/noise at launch, e.g. to inspect the noiseless ideal signal:
+
+```bash
+ros2 run field_rover_sim imu_sensor --ros-args \
+  -p gyro_noise_stddev:=0.0 -p accel_noise_stddev:=0.0
 ```
 
 ## Package Structure
@@ -142,3 +218,4 @@ cd rover_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --symlink-install
 source install/setup.bash
+```
