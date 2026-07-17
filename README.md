@@ -6,26 +6,26 @@ This project is a progression beyond my completed ROS 2 Autonomous Rover Control
 
 ## Current Status
 
-July 19 foundation milestone:
+Day 1 foundation milestone:
 
 - Project scope defined before implementation
 - ROS 2 Jazzy development-container configuration added
 - ROS 2 workspace created
 - Five responsibility-based packages scaffolded
 
-July 20 static-world milestone:
+Day 2 static-world milestone:
 
 - Static 2D world model (20.0 m x 15.0 m) with three circular obstacles
 - Pure-Python obstacle and boundary collision checks
 - `world_simulator` node publishing ground-truth `/ground_truth/odom`
 
-July 21 rover-motion milestone:
+Day 3 rover-motion milestone:
 
 - Constrained unicycle motion with speed, acceleration, and turn-rate limits
 - `/cmd_vel` (`geometry_msgs/msg/Twist`) drives the simulated rover
 - Collision-safe pose integration (blocked translation still allows rotation)
 
-July 22 directional range-sensing milestone:
+Day 4 directional range-sensing milestone:
 
 - Pure-Python ray-casting geometry (`field_rover_sim/range_sensor.py`) for
   ray-circle and ray-boundary intersection, independent of ROS 2
