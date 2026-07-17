@@ -33,6 +33,16 @@ Day 4 directional range-sensing milestone:
   `/ground_truth/odom`
 - Ideal, noiseless distance readings; no wheel/IMU/GPS sensing yet
 
+Day 5 wheel-odometry milestone:
+
+- Pure-Python differential-drive wheel-odometry model
+  (`field_rover_sim/wheel_odometry.py`), independent of ROS 2
+- `wheel_odometry` node dead-reckoning an imperfect pose estimate from
+  simulated left/right wheel travel
+- Configurable per-wheel calibration scale factors that produce gradual,
+  cumulative drift away from ground truth — the first intentionally
+  imperfect position estimate in the project
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -62,11 +72,48 @@ world boundary along each beam.
 - Measurements are ideal and noiseless, computed directly from ground
   truth; noise, drift, and sensor failures are not implemented.
 
-Run both nodes together:
+### Wheel odometry
+
+The `wheel_odometry` node dead-reckons an independent, imperfect pose estimate
+by simulating differential-drive wheel travel from the true rover velocity,
+instead of republishing ground truth with an offset.
+
+- Subscribes to `/ground_truth/odom` (`nav_msgs/msg/Odometry`) and uses
+  `twist.twist.linear.x` / `twist.twist.angular.z` as the ideal rover
+  velocity that drives the simulated left/right wheels.
+- Converts rover velocity to wheel velocities with
+  `v_left = v - omega * L / 2`, `v_right = v + omega * L / 2`, where `L` is
+  `wheel_track_width`.
+- Applies configurable `left_wheel_scale` / `right_wheel_scale` calibration
+  factors to each wheel's true distance increment before reconstructing
+  centre travel and heading change, then integrates pose with a midpoint
+  heading (`heading_mid = yaw + delta_yaw / 2`) for better accuracy through
+  curves.
+- Publishes `nav_msgs/msg/Odometry` on `/wheel/odom` with
+  `header.frame_id = "odom"` and `child_frame_id = "base_link"`.
+- Initializes its pose estimate once from the first `/ground_truth/odom`
+  message, then evolves entirely through dead reckoning — it never corrects
+  itself against ground truth again, so calibration error accumulates.
+- Default parameters: `wheel_track_width` = 0.6 m, `left_wheel_scale` = 1.01,
+  `right_wheel_scale` = 0.99. The left wheel over-reports distance and the
+  right wheel under-reports it, so straight driving gradually drifts in
+  heading and, through that wrong heading, in position.
+- No IMU, GPS, random noise, or sensor fusion yet — only deterministic
+  wheel-calibration drift.
+
+Run all three nodes together:
 
 ```bash
 ros2 run field_rover_sim world_simulator
 ros2 run field_rover_sim range_sensor
+ros2 run field_rover_sim wheel_odometry
+```
+
+Override calibration at launch, e.g. to compare against perfect wheels:
+
+```bash
+ros2 run field_rover_sim wheel_odometry --ros-args \
+  -p left_wheel_scale:=1.0 -p right_wheel_scale:=1.0
 ```
 
 ## Package Structure

@@ -28,6 +28,8 @@ setup(
             'field_rover_sim.world_simulator_node:main',
             'range_sensor = '
             'field_rover_sim.range_sensor_node:main',
+            'wheel_odometry = '
+            'field_rover_sim.wheel_odometry_node:main',
         ],
     },
 )
