@@ -32,6 +32,8 @@ setup(
             'field_rover_sim.wheel_odometry_node:main',
             'imu_sensor = '
             'field_rover_sim.imu_sensor_node:main',
+            'gps_sensor = '
+            'field_rover_sim.gps_sensor_node:main',
         ],
     },
 )

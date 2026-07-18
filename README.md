@@ -58,6 +58,20 @@ Day 6 simulated-IMU milestone:
   (`orientation_covariance[0] = -1.0`) since this milestone measures motion,
   it does not estimate heading
 
+Day 7 simulated-GPS milestone:
+
+- Pure-Python GPS model (`field_rover_sim/gps_sensor.py`), independent of
+  ROS 2, converting local east/north metres into latitude/longitude with a
+  small-distance local-plane approximation
+- `gps_sensor` node publishing low-rate `sensor_msgs/msg/NavSatFix` fixes
+  from `/ground_truth/odom`, independent of wheel odometry, the IMU, and
+  range sensing — GPS is a measurement source only, it does not correct or
+  fuse with any other estimate
+- Configurable constant horizontal bias, reproducible seeded Gaussian
+  noise, and reproducible seeded dropouts that skip a scheduled update
+  entirely (no fake or repeated fix); a ROS timer publishes independently
+  of how often ground truth arrives, at a lower rate than the simulator
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -169,13 +183,70 @@ Publishes `sensor_msgs/msg/Imu` on `/imu/data` with `header.frame_id =
 "imu_link"`. No GPS or sensor fusion is implemented yet — Day 6 produces
 measurements only; it does not estimate pose, heading, or velocity.
 
-Run all four nodes together:
+### Simulated GPS
+
+The `gps_sensor` node converts the rover's true local `(x, y)` position into
+a simulated, imperfect geographic fix. It is independent of `wheel_odometry`,
+`imu_sensor`, and `range_sensor` — a separate low-rate sensor with its own
+bias, noise, and dropouts. **It never corrects or fuses with any other
+estimate**; Day 7 produces measurements only.
+
+This is a **local tangent-plane approximation**, not general-purpose geodesy:
+
+- World `x` is treated as east metres and world `y` as north metres, both
+  measured from a configurable geographic reference point
+  (`reference_latitude_deg`, `reference_longitude_deg`).
+- Latitude/longitude use a small-distance spherical-Earth approximation —
+  accurate for this ~20 m x 15 m world, not suitable for long-distance
+  navigation. No GeographicLib, PROJ, or UTM dependency is used.
+- Altitude is always the constant `reference_altitude_m`; vertical rover
+  motion is not simulated.
+
+Math, in order:
+
+1. Constant bias and reproducible seeded Gaussian noise are added to the
+   true local east/north position, in metres (`position_bias_east_m`,
+   `position_bias_north_m`, `position_noise_stddev_m`).
+2. `delta_latitude_rad = north_m / EARTH_RADIUS_M`;
+   `delta_longitude_rad = east_m / (EARTH_RADIUS_M * cos(reference_latitude))`
+   — longitude depends on the reference latitude because a degree of
+   longitude covers fewer metres away from the equator.
+3. The reference latitude/longitude plus those deltas give the fix.
+
+Subscribes to `/ground_truth/odom` (`nav_msgs/msg/Odometry`) and only stores
+the latest position — it does not publish inside that callback. A separate
+ROS timer (`publish_rate_hz` = 2.0 Hz by default, versus the simulator's
+20 Hz) makes an independent, seeded Bernoulli dropout decision
+(`dropout_probability` = 0.10 by default) on every scheduled update; a
+dropout skips publication entirely for that tick (no fake or repeated fix).
+Noise and dropout draw from two separate seeded `random.Random` streams
+(`random_seed` and `random_seed + 1`) so one behaviour can't accidentally
+perturb the other. No fix is published before the first `/ground_truth/odom`
+message arrives.
+
+Publishes `sensor_msgs/msg/NavSatFix` on `/gps/fix` with
+`header.frame_id = "gps_link"`, `status.status = STATUS_FIX`,
+`status.service = SERVICE_GPS`, and diagonal
+`position_covariance` (`COVARIANCE_TYPE_DIAGONAL_KNOWN`): east/north
+variance equal to `position_noise_stddev_m ** 2` (random noise only, not
+the constant bias), and a large fixed vertical variance marking the
+unmodelled altitude axis as untrustworthy.
+
+Default parameters: `publish_rate_hz` = 2.0, `reference_latitude_deg` =
+43.2609, `reference_longitude_deg` = -79.9192, `reference_altitude_m` = 0.0,
+`position_bias_east_m` = 0.40 m, `position_bias_north_m` = -0.25 m,
+`position_noise_stddev_m` = 1.0 m, `dropout_probability` = 0.10,
+`random_seed` = 42. The reference point is just a configurable local origin,
+not a claim about where the simulated world physically sits.
+
+Run all five nodes together:
 
 ```bash
 ros2 run field_rover_sim world_simulator
 ros2 run field_rover_sim range_sensor
 ros2 run field_rover_sim wheel_odometry
 ros2 run field_rover_sim imu_sensor
+ros2 run field_rover_sim gps_sensor
 ```
 
 Override calibration at launch, e.g. to compare against perfect wheels:
@@ -191,6 +262,17 @@ Override IMU bias/noise at launch, e.g. to inspect the noiseless ideal signal:
 ros2 run field_rover_sim imu_sensor --ros-args \
   -p gyro_noise_stddev:=0.0 -p accel_noise_stddev:=0.0
 ```
+
+Override GPS noise/dropout at launch, e.g. to inspect the ideal fix:
+
+```bash
+ros2 run field_rover_sim gps_sensor --ros-args \
+  -p position_noise_stddev_m:=0.0 -p dropout_probability:=0.0
+```
+
+No localization or sensor fusion is implemented yet — wheel odometry, the
+IMU, and GPS each publish an independent, imperfect measurement, and nothing
+in this repository combines them into a single position estimate.
 
 ## Package Structure
 
