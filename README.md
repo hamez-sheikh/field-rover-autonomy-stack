@@ -72,6 +72,24 @@ Day 7 simulated-GPS milestone:
   entirely (no fake or repeated fix); a ROS timer publishes independently
   of how often ground truth arrives, at a lower rate than the simulator
 
+Day 8: Multi-sensor localization milestone:
+
+- Pure-Python planar pose estimator
+  (`field_rover_localization/pose_estimator.py`), independent of ROS 2,
+  fusing wheel odometry, IMU yaw rate, and GPS position into one estimate
+- Pure-Python geographic-to-local conversion
+  (`field_rover_localization/geographic_conversion.py`), the inverse of
+  the Day 7 GPS approximation, reimplemented rather than imported so this
+  package never depends on `field_rover_sim`
+- `localization` node subscribing to `/wheel/odom`, `/imu/data`, and
+  `/gps/fix`, publishing a single fused `nav_msgs/msg/Odometry` on
+  `/localization/odom`
+- A **complementary-style** estimator, not an EKF: no covariance
+  propagation through a process model, only a fixed nominal output
+  covariance
+- Continues dead-reckoning through GPS dropouts and IMU staleness; never
+  hard-resets to a GPS fix and never subscribes to `/ground_truth/odom`
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -239,7 +257,78 @@ Default parameters: `publish_rate_hz` = 2.0, `reference_latitude_deg` =
 `random_seed` = 42. The reference point is just a configurable local origin,
 not a claim about where the simulated world physically sits.
 
-Run all five nodes together:
+### Multi-sensor localization
+
+The `localization` node fuses three independent, imperfect measurements —
+`/wheel/odom` (`nav_msgs/msg/Odometry`), `/imu/data` (`sensor_msgs/msg/Imu`),
+and `/gps/fix` (`sensor_msgs/msg/NavSatFix`) — into one continuous planar
+pose estimate, published as `nav_msgs/msg/Odometry` on `/localization/odom`
+with `header.frame_id = "map"` and `child_frame_id = "base_link"`. It never
+subscribes to `/ground_truth/odom`; ground truth exists only for evaluating
+this estimate afterwards, never as an estimator input.
+
+This is a **complementary-style estimator, not an Extended Kalman Filter**:
+there is no state covariance propagated through a process model and no
+Kalman gain computed from measurement/process noise. Fusion instead uses
+fixed, hand-picked weights and gains, and the published covariance below is
+a static nominal description of confidence, not a probabilistically
+propagated one.
+
+Prediction versus correction:
+
+- **Prediction** runs on every `/wheel/odom` message and owns the
+  estimator's timing — `dt` comes from consecutive wheel-message
+  timestamps. Wheel `twist.twist.linear.x` drives forward motion; wheel
+  `twist.twist.angular.z` is the baseline turn rate. When a fresh IMU
+  sample is available, it is bias-corrected
+  (`omega_imu_corrected = omega_imu_raw - imu_gyro_bias_correction`) and
+  blended with the wheel turn rate by `imu_yaw_rate_weight`
+  (`omega_fused = weight * omega_imu_corrected + (1 - weight) *
+  omega_wheel`); a missing, invalid, future-dated, or stale
+  (`age > imu_timeout_s`) IMU sample falls back to the wheel rate alone.
+  Pose then integrates with a midpoint heading
+  (`heading_mid = yaw + delta_yaw / 2`), matching the same integration
+  style as `wheel_odometry`.
+- **Correction** runs once per accepted `/gps/fix`. Latitude/longitude is
+  converted to local east/north metres by
+  `field_rover_localization/geographic_conversion.py` — the inverse of the
+  Day 7 GPS approximation, reimplemented rather than imported, so this
+  package never depends on `field_rover_sim`. The resulting innovation
+  (`gps_position - estimated_position`) is rejected outright if its
+  distance exceeds `max_gps_innovation_m` (an implausible fix, e.g. a bad
+  read or a dropout-adjacent spike); otherwise only a `gps_position_gain`
+  fraction of it is applied
+  (`estimated_position += gps_position_gain * innovation`). GPS never
+  touches yaw or velocity, and a dropped/late/duplicate fix is never
+  reapplied — a missing `/gps/fix` update simply leaves prediction running
+  on wheel/IMU alone, so a GPS dropout degrades smoothly instead of
+  freezing or resetting the estimate.
+
+Initialization: the estimate is seeded once from the very first
+`/wheel/odom` message (`x`, `y`, and `yaw` copied directly from its pose;
+no integration on that first message), then evolves through prediction and
+correction from there. A GPS or IMU message that arrives before that first
+wheel pose is safely ignored/stored rather than corrupting an estimate that
+does not exist yet — localization does not wait for GPS to begin.
+
+Covariance is a fixed nominal diagonal, not shrinking after a correction or
+growing during dead reckoning: `position_variance` for `x`/`y` and
+`yaw_variance` for yaw, `linear_velocity_variance` for linear-x and
+`angular_velocity_variance` for angular-z, with a large fixed variance for
+every unmodelled axis (`z`, roll, pitch, linear-y/z, angular-x/y) to mark
+them as untrustworthy placeholders.
+
+Default parameters: `imu_yaw_rate_weight` = 0.70, `imu_gyro_bias_correction`
+= 0.01 rad/s, `imu_timeout_s` = 0.20 s, `gps_position_gain` = 0.20,
+`max_gps_innovation_m` = 5.0 m, `max_dt` = 0.50 s, `reference_latitude_deg`
+= 43.2609, `reference_longitude_deg` = -79.9192 (matching the Day 7 GPS
+reference), `position_variance` = 0.50, `yaw_variance` = 0.05,
+`linear_velocity_variance` = 0.10, `angular_velocity_variance` = 0.02.
+
+Mapping and path planning are not implemented yet — Day 8 produces a fused
+pose estimate only.
+
+Run all six nodes together:
 
 ```bash
 ros2 run field_rover_sim world_simulator
@@ -247,6 +336,7 @@ ros2 run field_rover_sim range_sensor
 ros2 run field_rover_sim wheel_odometry
 ros2 run field_rover_sim imu_sensor
 ros2 run field_rover_sim gps_sensor
+ros2 run field_rover_localization localization
 ```
 
 Override calibration at launch, e.g. to compare against perfect wheels:
@@ -270,9 +360,17 @@ ros2 run field_rover_sim gps_sensor --ros-args \
   -p position_noise_stddev_m:=0.0 -p dropout_probability:=0.0
 ```
 
-No localization or sensor fusion is implemented yet — wheel odometry, the
-IMU, and GPS each publish an independent, imperfect measurement, and nothing
-in this repository combines them into a single position estimate.
+Override localization fusion parameters at launch, e.g. to trust the IMU
+turn rate completely and correct fully to each GPS fix:
+
+```bash
+ros2 run field_rover_localization localization --ros-args \
+  -p imu_yaw_rate_weight:=1.0 -p gps_position_gain:=1.0
+```
+
+Wheel odometry, the IMU, and GPS each still publish an independent,
+imperfect measurement; `localization` is the only node in this repository
+that combines them into a single fused position estimate.
 
 ## Package Structure
 

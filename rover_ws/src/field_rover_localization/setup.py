@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'localization = '
+            'field_rover_localization.localization_node:main',
         ],
     },
 )
