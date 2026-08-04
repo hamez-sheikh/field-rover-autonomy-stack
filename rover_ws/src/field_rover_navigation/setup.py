@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'occupancy_grid_publisher = '
+            'field_rover_navigation.occupancy_grid_node:main',
         ],
     },
 )

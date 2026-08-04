@@ -90,6 +90,26 @@ Day 8: Multi-sensor localization milestone:
 - Continues dead-reckoning through GPS dropouts and IMU staleness; never
   hard-resets to a GPS fix and never subscribes to `/ground_truth/odom`
 
+Day 9: Occupancy-grid mapping milestone:
+
+- Pure-Python bounded-evidence occupancy-grid model
+  (`field_rover_navigation/occupancy_grid.py`), independent of ROS 2,
+  covering grid geometry, integer Bresenham ray traversal, evidence
+  updates, and occupancy encoding
+- `occupancy_grid_publisher` node subscribing to `/localization/odom` and
+  the five `/range/<beam>` topics, publishing `nav_msgs/msg/OccupancyGrid`
+  on `/map`
+- A **bounded evidence model, not a Bayesian log-odds filter**: each cell's
+  integer evidence is nudged by a fixed free/occupied delta and clamped, so
+  repeated observations can always overturn stale evidence
+- A timer drives mapping so each fresh, not-yet-processed beam sample is
+  applied exactly once; the map keeps publishing through a temporary
+  sensor or localization dropout, and never subscribes to
+  `/ground_truth/odom`
+- This is mapping, not SLAM: it consumes the Day 8 pose estimate as given
+  and does not estimate or correct the rover's own position; path planning
+  is not implemented yet
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -328,7 +348,83 @@ reference), `position_variance` = 0.50, `yaw_variance` = 0.05,
 Mapping and path planning are not implemented yet — Day 8 produces a fused
 pose estimate only.
 
-Run all six nodes together:
+### Occupancy-grid mapping
+
+The `occupancy_grid_publisher` node (package `field_rover_navigation`) builds
+a persistent 2D map from `/localization/odom` and the five `/range/<beam>`
+topics, publishing `nav_msgs/msg/OccupancyGrid` on `/map` with
+`header.frame_id = "map"`. It never subscribes to `/ground_truth/odom` and
+never imports simulator or localization internals — only standard ROS 2
+messages go in. This is **occupancy-grid mapping, not SLAM**: it consumes
+Day 8's pose estimate as given and does not estimate or correct the rover's
+pose itself, and no planning is implemented yet.
+
+The mapped world matches the Day 2 static world: `world_width_m` = 20.0 m,
+`world_height_m` = 15.0 m, at `resolution_m` = 0.25 m, giving an 80 x 60
+(4800-cell) grid anchored at `origin_x_m` = 0.0, `origin_y_m` = 0.0.
+
+This is a **bounded evidence model, not a Bayesian log-odds filter**: each
+cell holds an integer evidence value starting at 0 (unknown). Every
+processed beam sample nudges the cells it touches by a fixed delta —
+`free_evidence_delta` = -1 for a free cell, `occupied_evidence_delta` = +3
+for an occupied cell — clamped to `[minimum_evidence, maximum_evidence]` =
+`[-5, 5]` so repeated contradictory observations can always overturn stale
+evidence instead of it saturating forever. Evidence is encoded into the
+published `OccupancyGrid` cell values (`-1` unknown, `0` free, `100`
+occupied) by two thresholds: evidence `<= free_threshold` (-1) is free,
+evidence `>= occupied_threshold` (+1) is occupied, and anything strictly
+between stays unknown.
+
+For each beam, cells are traced from the rover's grid cell to the measured
+endpoint with an integer Bresenham line: intermediate cells are marked
+free, and the endpoint is marked occupied — unless the reading is at
+`max_range` (the range sensor's no-detection value), in which case the
+whole beam only marks free space and no endpoint is occupied. The rover's
+own cell is always marked free, never occupied, even for a very short
+(minimum-range) reading. A measured endpoint that falls outside the mapped
+world only frees the in-map portion of the ray; a hit exactly on the map's
+outer edge resolves to the last valid cell rather than being discarded. An
+invalid reading (`NaN`, infinite, or outside `[min_range, max_range]` by
+more than a small floating-point tolerance) is rejected outright and never
+touches the grid.
+
+A `map_update_rate_hz` = 5.0 Hz timer drives mapping instead of updating
+directly from each subscription callback: on every tick, it applies every
+range sample that is both fresh (`age <= range_timeout_s` = 0.5 s) and not
+already processed (a strictly newer timestamp than the last one applied to
+that beam), but only while the latest `/localization/odom` pose is itself
+fresh (`age <= localization_timeout_s` = 0.5 s). One beam can update while
+another sits stale or missing entirely. The timer always republishes the
+current grid on every tick regardless of whether a fresh update landed, so
+the map keeps publishing through a temporary sensor or localization
+dropout instead of going silent. The `/map` publisher uses a
+transient-local, depth-1 QoS profile so a subscriber that starts late still
+receives the latest map.
+
+Ground truth is never read by this node; it exists only to evaluate the
+resulting map afterwards, exactly as with Day 8 localization.
+
+Run the full pipeline, including mapping:
+
+```bash
+ros2 run field_rover_sim world_simulator
+ros2 run field_rover_sim range_sensor
+ros2 run field_rover_sim wheel_odometry
+ros2 run field_rover_sim imu_sensor
+ros2 run field_rover_sim gps_sensor
+ros2 run field_rover_localization localization
+ros2 run field_rover_navigation occupancy_grid_publisher
+```
+
+Override mapping parameters at launch, e.g. to update the map faster and
+require stricter evidence before marking a cell occupied:
+
+```bash
+ros2 run field_rover_navigation occupancy_grid_publisher --ros-args \
+  -p map_update_rate_hz:=10.0 -p occupied_threshold:=3
+```
+
+Run all six sensing/localization nodes together:
 
 ```bash
 ros2 run field_rover_sim world_simulator
