@@ -26,6 +26,8 @@ setup(
         'console_scripts': [
             'occupancy_grid_publisher = '
             'field_rover_navigation.occupancy_grid_node:main',
+            'astar_planner = '
+            'field_rover_navigation.astar_planner_node:main',
         ],
     },
 )

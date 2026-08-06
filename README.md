@@ -107,8 +107,29 @@ Day 9: Occupancy-grid mapping milestone:
   sensor or localization dropout, and never subscribes to
   `/ground_truth/odom`
 - This is mapping, not SLAM: it consumes the Day 8 pose estimate as given
-  and does not estimate or correct the rover's own position; path planning
-  is not implemented yet
+  and does not estimate or correct the rover's own position; Day 10 adds
+  path planning on top of this map
+
+Day 10: A* path planning milestone:
+
+- Pure-Python eight/four-connected A* planner
+  (`field_rover_navigation/astar_planner.py`), independent of ROS 2, reusing
+  Day 9's `world_to_grid` / `grid_to_world_center` conversion helpers rather
+  than duplicating that math
+- `astar_planner` node subscribing to `/map`, `/localization/odom`, and
+  `/goal_pose`, publishing `nav_msgs/msg/Path` on `/planned_path`
+- Eight-connected search by default (`allow_diagonal=true`), Euclidean-cost
+  diagonal steps (`sqrt(2)`), an octile heuristic, and corner-cut
+  prevention so a diagonal move is only allowed when both orthogonal cells
+  it passes between are also traversable
+- Unknown cells are blocked by default (`allow_unknown=false`); occupied
+  cells (`>= occupied_threshold` = 50) are always blocked
+- Publishes an empty `Path` on any planning failure (occupied, unknown, or
+  out-of-map start/goal, or no route) and logs a concise reason; the node
+  stays alive and accepts the next goal
+- This is **path generation only**: it never subscribes to
+  `/ground_truth/odom` and never publishes `/cmd_vel`; path following and
+  automatic replanning are not implemented yet
 
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
@@ -357,7 +378,7 @@ topics, publishing `nav_msgs/msg/OccupancyGrid` on `/map` with
 never imports simulator or localization internals — only standard ROS 2
 messages go in. This is **occupancy-grid mapping, not SLAM**: it consumes
 Day 8's pose estimate as given and does not estimate or correct the rover's
-pose itself, and no planning is implemented yet.
+pose itself; Day 10 adds A* path planning on top of this map.
 
 The mapped world matches the Day 2 static world: `world_width_m` = 20.0 m,
 `world_height_m` = 15.0 m, at `resolution_m` = 0.25 m, giving an 80 x 60
@@ -467,6 +488,87 @@ ros2 run field_rover_localization localization --ros-args \
 Wheel odometry, the IMU, and GPS each still publish an independent,
 imperfect measurement; `localization` is the only node in this repository
 that combines them into a single fused position estimate.
+
+### A* path planning
+
+The `astar_planner` node (package `field_rover_navigation`) plans a
+collision-free grid path from the rover's current fused pose to a
+requested goal. It subscribes to `/map` (`nav_msgs/msg/OccupancyGrid`),
+`/localization/odom` (`nav_msgs/msg/Odometry`), and `/goal_pose`
+(`geometry_msgs/msg/PoseStamped`), and publishes `nav_msgs/msg/Path` on
+`/planned_path` with `header.frame_id = "map"`. It never subscribes to
+`/ground_truth/odom`, never imports simulator internals, and never
+publishes `/cmd_vel` — this is **path generation only**: path following
+and automatic replanning are not implemented yet.
+
+All search mathematics lives in a ROS-independent pure module,
+`field_rover_navigation/astar_planner.py`. It reuses Day 9's
+`world_to_grid` and `grid_to_world_center` conversion helpers (via a small
+duck-typed `GridGeometry`) rather than reimplementing that math a second
+time, so a world coordinate maps to the same grid cell everywhere in this
+package.
+
+By default the planner searches **eight-connected**
+(`allow_diagonal=true`): orthogonal steps cost `1.0`, diagonal steps cost
+`sqrt(2)`, and the A* heuristic is the matching **octile distance**
+(`max(dx, dy) + (sqrt(2) - 1) * min(dx, dy)`), which never overestimates
+the true movement cost. Setting `allow_diagonal=false` switches to
+four-connected search with a Manhattan heuristic instead. Every diagonal
+move is rejected unless both orthogonal cells it passes between are also
+traversable (`prevent_corner_cutting=true` by default), so a path can
+never squeeze through the corner between two touching blocked cells.
+
+Occupancy is read directly from the incoming `OccupancyGrid` values: a
+cell `>= occupied_threshold` (50) is always blocked; a cell equal to `-1`
+(unknown) is blocked unless `allow_unknown=true`, in which case it can be
+entered at an extra `unknown_traversal_cost` (5.0) on top of the normal
+step cost. The default stays conservative (`allow_unknown=false`) — the
+planner never silently treats unmapped space as safe. Planning is
+rejected outright, with a concise logged reason and an **empty published
+`Path`**, whenever the map metadata or data length is invalid, the start
+or goal falls outside the map, or the start or goal cell is occupied or
+(by default) unknown. A goal inside the rover's current cell succeeds
+trivially with a one-cell, zero-cost path. Search is bounded by
+`max_expansions` (100000, far above the Day 9 map's 4800 cells) so a
+provably unreachable goal fails cleanly instead of searching forever.
+
+The open set is a `heapq` priority queue keyed on `(f_score, tie_break,
+g_score, cell)`, where `tie_break` is a monotonically increasing counter —
+so two cells with an identical priority always pop in the same order, and
+planning the same map/start/goal/configuration repeatedly always returns
+the same path and cost. Each published pose is oriented to face the next
+point on the path (`atan2` between consecutive world points); the final
+pose keeps the heading of the segment that reaches it, or the requested
+goal orientation for a single-cell path.
+
+Run the full pipeline, including planning:
+
+```bash
+ros2 run field_rover_sim world_simulator
+ros2 run field_rover_sim range_sensor
+ros2 run field_rover_sim wheel_odometry
+ros2 run field_rover_sim imu_sensor
+ros2 run field_rover_sim gps_sensor
+ros2 run field_rover_localization localization
+ros2 run field_rover_navigation occupancy_grid_publisher
+ros2 run field_rover_navigation astar_planner
+```
+
+Publish a sample goal once the map has observed enough free space around
+it:
+
+```bash
+ros2 topic pub -1 /goal_pose geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: 'map'}, pose: {position: {x: 3.0, y: 1.0}}}"
+```
+
+Override planning parameters at launch, e.g. to require a wider safety
+margin from occupied evidence and disable diagonal movement:
+
+```bash
+ros2 run field_rover_navigation astar_planner --ros-args \
+  -p occupied_threshold:=1 -p allow_diagonal:=false
+```
 
 ## Package Structure
 
