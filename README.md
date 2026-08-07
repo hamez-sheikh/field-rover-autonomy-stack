@@ -131,6 +131,26 @@ Day 10: A* path planning milestone:
   `/ground_truth/odom` and never publishes `/cmd_vel`; path following and
   automatic replanning are not implemented yet
 
+Day 11: C++ path following milestone:
+
+- Pure C++ lookahead controller (`field_rover_control/path_follower.hpp`/
+  `.cpp`), independent of ROS 2, reused as-is by the `path_follower` node
+- `path_follower` node (package `field_rover_control`) subscribing to
+  `/planned_path` and `/localization/odom`, publishing
+  `geometry_msgs/msg/Twist` on `/cmd_vel`
+- Monotonic lookahead-based proportional control: progress along the path
+  only advances, heading error is controlled proportionally, and forward
+  speed is scaled down (and cut entirely above a turn-in-place threshold)
+  for large heading errors
+- Publishes a zero-velocity `Twist` whenever no path is active, the path
+  is empty or invalid, localization has never arrived or has gone stale,
+  the pose or path contains non-finite values, or the final goal has been
+  reached — and never continues publishing a stale non-zero command
+- This is **path following only**: it never subscribes to
+  `/ground_truth/odom`, never plans or replans a path, and never performs
+  obstacle avoidance directly from range data; multi-waypoint missions
+  and replanning are not implemented yet
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -568,6 +588,106 @@ margin from occupied evidence and disable diagonal movement:
 ```bash
 ros2 run field_rover_navigation astar_planner --ros-args \
   -p occupied_threshold:=1 -p allow_diagonal:=false
+```
+
+### C++ path following
+
+The `path_follower` node (package `field_rover_control`, `ament_cmake`/C++)
+drives the rover along the current `/planned_path`. It subscribes to
+`/planned_path` (`nav_msgs/msg/Path`, frame `map`) and `/localization/odom`
+(`nav_msgs/msg/Odometry`, frame `map`, child frame `base_link`), and
+publishes `geometry_msgs/msg/Twist` on `/cmd_vel`. It never subscribes to
+`/ground_truth/odom` and never publishes a path — **this is path following
+only**: multi-waypoint missions, automatic replanning, obstacle avoidance
+from range data, and path smoothing are all out of scope for Day 11.
+
+All tracking math lives in a ROS-independent pure library,
+`field_rover_control/path_follower.hpp`/`.cpp`: plain `Point2D`/`Pose2D`
+structs, no `rclcpp`, no ROS messages, no ROS time. The node
+(`field_rover_control/path_follower_node.hpp`/`.cpp`) only converts ROS
+messages to and from that library and tracks localization freshness with
+the ROS clock — a concern the pure library deliberately does not know
+about.
+
+Lookahead target selection, every control update:
+
+1. Search forward from the last saved progress index for the closest
+   path point — never backward, so progress is **monotonic** even if the
+   rover briefly drifts toward an earlier point.
+2. From that nearest point, scan forward for the first point at least
+   `lookahead_distance_m` away; if none is far enough, fall back to the
+   final path point. A one-point path is simply its own final point.
+3. Steer toward that lookahead target with proportional heading control:
+
+   ```text
+   desired_heading = atan2(target_y - rover_y, target_x - rover_x)
+   heading_error = normalize_angle(desired_heading - rover_yaw)
+   angular_velocity = clamp(angular_gain * heading_error,
+                             -max_angular_speed, +max_angular_speed)
+   ```
+
+4. Scale forward speed down by `max(0, cos(heading_error))` and clamp to
+   `max_linear_speed_mps`, so the rover slows for a large heading error
+   and never reverses; above `turn_in_place_threshold_rad` it turns in
+   place (`linear_x = 0`) instead of arcing toward the target.
+5. Stop once the final path point is within `goal_tolerance_m` — based on
+   position only, Day 11 does not require matching the final goal
+   orientation — and stay stopped until a new path arrives.
+
+The node publishes a zero `Twist` — never the last non-zero command —
+whenever any of the following holds: no path has ever been received, the
+latest path was empty or contained a non-finite point or the wrong
+`frame_id`, no `/localization/odom` message has ever arrived, the latest
+one is older than `localization_timeout_s` or contains a non-finite pose
+or a degenerate orientation quaternion, or the final goal has already been
+reached. A control-loop timer (`control_rate_hz`) drives every publish, so
+a stale input is re-evaluated on every tick rather than freezing the last
+command. A zero `header.stamp` on `/localization/odom` is treated as "not
+stamped" and falls back to this node's receipt time for the freshness
+check, rather than reading as infinitely stale.
+
+Default parameters (all validated at startup — see
+`is_valid_config()` in `path_follower.hpp`):
+
+```text
+control_rate_hz = 20.0
+lookahead_distance_m = 0.60
+goal_tolerance_m = 0.25
+max_linear_speed_mps = 0.45
+max_angular_speed_radps = 0.80
+linear_gain = 0.80
+angular_gain = 1.80
+turn_in_place_threshold_rad = 1.00
+localization_timeout_s = 0.50
+map_frame = "map"
+base_frame = "base_link"
+```
+
+`max_linear_speed_mps` and `max_angular_speed_radps` stay comfortably
+under the Day 3 simulator's own `max_forward_speed` (1.0 m/s) and
+`max_turn_rate` (1.0 rad/s) limits, so the controller never requests a
+velocity the simulator itself would have to clamp.
+
+Run the full pipeline, including path following:
+
+```bash
+ros2 run field_rover_sim world_simulator
+ros2 run field_rover_sim range_sensor
+ros2 run field_rover_sim wheel_odometry
+ros2 run field_rover_sim imu_sensor
+ros2 run field_rover_sim gps_sensor
+ros2 run field_rover_localization localization
+ros2 run field_rover_navigation occupancy_grid_publisher
+ros2 run field_rover_navigation astar_planner
+ros2 run field_rover_control path_follower
+```
+
+Override a following parameter at launch, e.g. a shorter lookahead and a
+tighter goal tolerance:
+
+```bash
+ros2 run field_rover_control path_follower --ros-args \
+  -p lookahead_distance_m:=0.40 -p goal_tolerance_m:=0.15
 ```
 
 ## Package Structure
