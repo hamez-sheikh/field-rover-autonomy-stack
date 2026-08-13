@@ -151,6 +151,34 @@ Day 11: C++ path following milestone:
   obstacle avoidance directly from range data; multi-waypoint missions
   and replanning are not implemented yet
 
+Day 12: Multi-waypoint mission management milestone:
+
+- Pure Python mission-sequencing state machine
+  (`field_rover_navigation/mission_manager.py`), independent of ROS 2, reusing
+  Day 9's `is_measurement_fresh` freshness helper rather than duplicating
+  that math a third time
+- `mission_manager` node (package `field_rover_navigation`) subscribing to
+  `/localization/odom` and publishing `geometry_msgs/msg/PoseStamped` on
+  `/goal_pose`, one waypoint at a time
+- A simple three-state machine (`idle` / `active` / `complete`): a mission
+  starts active only when it has at least one waypoint and `auto_start` is
+  true; it advances at most one waypoint index per timer tick, and only
+  once the active waypoint is within `waypoint_tolerance_m` of the fused
+  position; progress never moves backward
+- Publishes the active waypoint's goal exactly once per index — not on
+  every timer tick — and republishes only when the active index changes,
+  either from startup or from an advancement
+- Stops advancing, without publishing a new goal or losing progress,
+  whenever localization has never arrived, has gone stale, or contains a
+  non-finite position; resumes automatically from the same active waypoint
+  once fresh localization returns
+- This is **mission sequencing only**: it never subscribes to
+  `/ground_truth/odom`, `/map`, or any `/range/<beam>` topic, never
+  publishes `/cmd_vel`, and never plans a path itself — planning stays with
+  Day 10's `astar_planner` and following stays with Day 11's
+  `path_follower`; replanning around an unreachable waypoint is not
+  implemented yet
+
 See [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the complete planned scope.
 
 ### Directional range sensor
@@ -689,6 +717,124 @@ tighter goal tolerance:
 ros2 run field_rover_control path_follower --ros-args \
   -p lookahead_distance_m:=0.40 -p goal_tolerance_m:=0.15
 ```
+
+### Multi-waypoint mission management
+
+The `mission_manager` node (package `field_rover_navigation`) sequences an
+ordered list of waypoint goals through the existing Day 10/11 pipeline. It
+subscribes to `/localization/odom` (`nav_msgs/msg/Odometry`, frame `map`)
+and publishes `geometry_msgs/msg/PoseStamped` on `/goal_pose`
+(`header.frame_id = "map"`), one waypoint at a time. It never subscribes to
+`/map`, any `/range/<beam>` topic, or `/ground_truth/odom`, and it never
+publishes `/cmd_vel` — **this is mission sequencing only**: it does not
+plan paths (that stays with `astar_planner`) and does not follow them
+(that stays with `path_follower`).
+
+All mission-sequencing logic lives in a ROS-independent pure module,
+`field_rover_navigation/mission_manager.py`: a `MissionConfig` describing
+the ordered waypoint list and sequencing behavior, a `MissionState`
+snapshot (waypoints, active index, and status), and small functions for
+each concern — initializing a mission, looking up the active waypoint,
+measuring distance to it, checking tolerance, and advancing the index.
+Localization freshness reuses Day 9's `is_measurement_fresh` helper from
+`occupancy_grid.py` rather than reimplementing that math a third time.
+
+**Mission input.** The mission is a pair of equal-length parameter arrays,
+declared directly on the node — no custom message, service, or action is
+introduced for Day 12:
+
+```text
+waypoint_x = [4.0, 7.0, 7.0]
+waypoint_y = [2.0, 2.0, 5.0]
+```
+
+Waypoints carry position only (`x`, `y`); Day 12 does not require or use a
+per-waypoint orientation. Every published goal uses the identity
+orientation (`orientation.w = 1.0`). An empty pair of arrays (the default
+length matches; zero length is valid) is a legal, empty mission: the node
+stays idle, publishes nothing, logs one concise message, and never
+crashes.
+
+**Sequencing.** A mission is a simple three-state machine — `idle`,
+`active`, `complete` — deliberately kept simpler than a general state
+machine, since only one thing can happen at a time: sequence forward or
+sit still.
+
+- A non-empty mission with `auto_start=true` (the default) starts
+  `active` at index 0. `auto_start=false` leaves even a non-empty mission
+  `idle` forever, since Day 12 defines no other start trigger.
+- Every timer tick (`mission_rate_hz`), the node publishes the active
+  waypoint's goal — but only once per index, not on every tick. Once
+  usable localization places the rover within `waypoint_tolerance_m` of
+  the active waypoint, the index advances by exactly one and the next
+  goal is published once. Reaching a waypoint never skips more than one
+  index ahead in a single tick, even if the rover also happens to be
+  within tolerance of the next one or two waypoints.
+- The index never moves backward. After the final waypoint is reached the
+  mission becomes `complete` and no further goal is published.
+
+**Completion rule**, based on position only (Day 12 does not require
+matching a final orientation):
+
+```text
+distance_to_waypoint = hypot(waypoint_x - localization_x, waypoint_y - localization_y)
+reached = distance_to_waypoint <= waypoint_tolerance_m
+```
+
+**Localization freshness.** The mission only advances (and only publishes
+a first or next goal) while localization is usable: a sample must have
+been received, its `x`/`y` must be finite, and its age must be within
+`localization_timeout_s` — the same 0.5 s default Day 11's
+`path_follower` uses. A zero `header.stamp` is treated as "not stamped"
+and falls back to this node's receipt time, the same documented
+convention `path_follower_node` uses in C++. While localization is
+missing or stale, the node stops advancing and publishes no new goal, but
+keeps the mission's progress exactly as it was; once fresh localization
+returns, evaluation simply resumes from the same active waypoint.
+
+Run the full pipeline, including mission sequencing:
+
+```bash
+ros2 run field_rover_sim world_simulator
+ros2 run field_rover_sim range_sensor
+ros2 run field_rover_sim wheel_odometry
+ros2 run field_rover_sim imu_sensor
+ros2 run field_rover_sim gps_sensor
+ros2 run field_rover_localization localization
+ros2 run field_rover_navigation occupancy_grid_publisher
+ros2 run field_rover_navigation astar_planner
+ros2 run field_rover_control path_follower
+ros2 run field_rover_navigation mission_manager
+```
+
+The default parameters already run a sample three-waypoint mission with
+no extra flags. Override the mission or its timing at launch, e.g. a
+two-waypoint mission with a tighter tolerance:
+
+```bash
+ros2 run field_rover_navigation mission_manager --ros-args \
+  -p waypoint_x:="[3.0, 6.0]" -p waypoint_y:="[1.0, 4.0]" \
+  -p waypoint_tolerance_m:=0.15
+```
+
+Default parameters:
+
+```text
+waypoint_x = [4.0, 7.0, 7.0]
+waypoint_y = [2.0, 2.0, 5.0]
+mission_rate_hz = 10.0
+waypoint_tolerance_m = 0.25
+localization_timeout_s = 0.50
+map_frame = "map"
+auto_start = true
+```
+
+**Known Day 12 limitation.** A waypoint that `astar_planner` can never
+plan to (for example, one inside an obstacle or across a fully blocked
+map) leaves the mission waiting indefinitely at that waypoint: Day 12 does
+not implement replanning or recovery, and does not inspect
+`/planned_path` at all. Automatic replanning around a newly blocked route
+is planned as future work, per `docs/PROJECT_SPEC.md`.
 
 ## Package Structure
 

@@ -28,6 +28,8 @@ setup(
             'field_rover_navigation.occupancy_grid_node:main',
             'astar_planner = '
             'field_rover_navigation.astar_planner_node:main',
+            'mission_manager = '
+            'field_rover_navigation.mission_manager_node:main',
         ],
     },
 )
